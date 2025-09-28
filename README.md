@@ -172,7 +172,7 @@ python bot.py
 
 - 📧 Email: lunareditor009@gmail.com
 - 💬 Discord: lunar5878
-- 🏠 Сервер поддержки: [Приглашение на ваш сервер](https://discord.gg/EPjggtXwUw)
+- 🏠 Сервер поддержки: [Приглашение](https://discord.gg/EPjggtXwUw)
 - 🐛 Баги: [Ссылка на Issues](https://github.com/1nt3r312/family-request-bot/issues)
 
 ## 📄 Документация
