@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import os
+import re
 from database import init_db, get_guild_settings, set_guild_settings
 from dotenv import load_dotenv
 
@@ -13,10 +14,12 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Временное хранилище для данных между шагом 1 и 2
+# Внимание: При перезагрузке бота эти данные очистятся!
 application_data = {}
 
-# Инициализация базы
-init_db()
+# --- МОДАЛЬНЫЕ ОКНА ---
 
 class ApplicationStep1Modal(discord.ui.Modal, title="Основная информация"):
     real_name = discord.ui.TextInput(label="Ваше реальное имя *", required=True, max_length=50)
@@ -24,14 +27,16 @@ class ApplicationStep1Modal(discord.ui.Modal, title="Основная инфор
     nickname = discord.ui.TextInput(label="Никнейм | Статик *", required=True, max_length=50)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Сохраняем данные первого шага
         application_data[interaction.user.id] = {
             'real_name': self.real_name.value,
             'age': self.age.value,
             'nickname': self.nickname.value
         }
+        # Отправляем кнопку для перехода ко второму шагу
         await interaction.response.send_message(
             "Первый шаг завершен! Нажмите кнопку ниже чтобы продолжить.",
-            view=ApplicationStep2View(),
+            view=ContinueApplicationView(),
             ephemeral=True
         )
 
@@ -45,16 +50,17 @@ class ApplicationStep2Modal(discord.ui.Modal, title="Дополнительна�
             guild_settings = get_guild_settings(interaction.guild.id)
             if not guild_settings or not guild_settings.get('channel_id'):
                 await interaction.response.send_message(
-                    "❌ Бот не настроен на этом сервере. Попросите администратора выполнить `!инструкция`",
+                    "❌ Бот не настроен на этом сервере. Администратор должен установить канал заявок.",
                     ephemeral=True
                 )
                 return
 
-            basic_info = application_data.get(interaction.user.id, {})
+            basic_info = application_data.get(interaction.user.id)
             if not basic_info:
-                await interaction.response.send_message("Данные первой формы не найдены. Начните заново.", ephemeral=True)
+                await interaction.response.send_message("❌ Данные первой формы устарели или утеряны. Пожалуйста, начните заново.", ephemeral=True)
                 return
 
+            # Формируем красивый Embed
             embed = discord.Embed(title="Новая заявка в семью", color=0x00ffcc)
             embed.add_field(name="Пользователь", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
             embed.add_field(name="Реальное имя", value=basic_info.get('real_name', '—'), inline=True)
@@ -64,7 +70,10 @@ class ApplicationStep2Modal(discord.ui.Modal, title="Дополнительна�
             embed.add_field(name="Источник", value=self.source.value, inline=True)
             embed.add_field(name="Часовой пояс", value=self.timezone.value, inline=True)
             
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            if interaction.user.display_avatar:
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            
+            # ВАЖНО: ID сохраняем в футере, чтобы потом считать его кнопками
             embed.set_footer(text=f"ID: {interaction.user.id} • {interaction.created_at.strftime('%d.%m.%Y %H:%M')}")
 
             channel_id = int(guild_settings['channel_id'])
@@ -72,14 +81,13 @@ class ApplicationStep2Modal(discord.ui.Modal, title="Дополнительна�
             
             if log_channel:
                 role_id = guild_settings.get('role_id')
-                if role_id:
-                    role_mention = f"<@&{role_id}>"
-                    await log_channel.send(f"{role_mention} Новая заявка!")
+                content_msg = f"<@&{role_id}> Новая заявка!" if role_id and role_id != 'None' else "Новая заявка!"
                 
-                await log_channel.send(embed=embed)
-                action_view = ApplicationActionsView(interaction.user.id, interaction.guild.id)
-                await log_channel.send("Действия с заявкой:", view=action_view)
+                await log_channel.send(content=content_msg, embed=embed)
+                # Отправляем меню действий (оно теперь Persistent)
+                await log_channel.send("Действия с заявкой:", view=PersistentApplicationActionsView())
                 
+                # Чистим память
                 if interaction.user.id in application_data:
                     del application_data[interaction.user.id]
                 
@@ -89,52 +97,89 @@ class ApplicationStep2Modal(discord.ui.Modal, title="Дополнительна�
                 
         except Exception as e:
             print(f"Ошибка при отправке заявки: {e}")
-            await interaction.response.send_message("❌ Произошла ошибка. Попробуйте позже.", ephemeral=True)
+            await interaction.response.send_message("❌ Произошла ошибка при обработке. Попробуйте позже.", ephemeral=True)
 
-class ApplicationStep2View(discord.ui.View):
+# --- VIEWS (КНОПКИ) ---
+
+class ContinueApplicationView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None) # Кнопка не исчезнет
 
-    @discord.ui.button(label="Продолжить заполнение", style=discord.ButtonStyle.blurple)
+    @discord.ui.button(label="Продолжить заполнение", style=discord.ButtonStyle.blurple, custom_id="app_continue_btn")
     async def continue_application(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in application_data:
-            await interaction.response.send_message("Данные утеряны. Начните заново.", ephemeral=True)
+            await interaction.response.send_message("❌ Данные утеряны (возможно, бот перезагружался). Начните заполнение заново.", ephemeral=True)
             return
         await interaction.response.send_modal(ApplicationStep2Modal())
 
-class ApplicationActionsView(discord.ui.View):
-    def __init__(self, applicant_id, guild_id):
-        super().__init__(timeout=None)
-        self.applicant_id = applicant_id
-        self.guild_id = guild_id
-        self.processed = False
+class PersistentApplicationActionsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) # Важно для сохранения работы после перезагрузки
 
-    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success, custom_id="accept_application")
-    async def accept_application(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.processed:
-            await interaction.response.send_message("Заявка уже обработана.", ephemeral=True)
-            return
-            
+    async def get_applicant_id(self, interaction: discord.Interaction):
+        """Извлекает ID подавшего заявку из футера Embed сообщения"""
         try:
-            applicant = await bot.fetch_user(self.applicant_id)
-            self.processed = True
-            for item in self.children:
-                item.disabled = True
+            # Ищем сообщение с Embed выше кнопок (обычно это предыдущее сообщение или сообщение, к которому прикреплен view)
+            # В твоем коде view отправляется отдельным сообщением "Действия с заявкой:"
+            # Нам нужно найти сообщение с Embed, которое находится ПЕРЕД сообщением с кнопками.
+            
+            history = [msg async for msg in interaction.channel.history(limit=5, before=interaction.message.created_at)]
+            target_embed = None
+            
+            # Ищем ближайшее сообщение с Embed от бота
+            for msg in history:
+                if msg.author == bot.user and msg.embeds:
+                    target_embed = msg.embeds[0]
+                    self.target_message = msg # Сохраняем ссылку на сообщение с эмбедом
+                    break
+            
+            if not target_embed or not target_embed.footer.text:
+                return None, None
 
-            original_embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            # Парсим ID из текста "ID: 123456789..."
+            footer_text = target_embed.footer.text
+            match = re.search(r"ID:\s*(\d+)", footer_text)
+            if match:
+                return int(match.group(1)), target_embed
+            return None, None
+        except Exception as e:
+            print(f"Ошибка парсинга ID: {e}")
+            return None, None
+
+    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success, custom_id="app_action_accept")
+    async def accept_application(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer() # Даем боту время подумать
+        
+        applicant_id, original_embed = await self.get_applicant_id(interaction)
+        
+        if not applicant_id:
+            await interaction.followup.send("❌ Не удалось найти заявку или ID пользователя.", ephemeral=True)
+            return
+
+        # Проверка: не нажал ли кнопку сам подающий (на всякий случай)
+        if interaction.user.id == applicant_id:
+             await interaction.followup.send("❌ Вы не можете принять свою заявку.", ephemeral=True)
+             return
+
+        try:
+            # Обновляем Embed (зеленый цвет)
             if original_embed:
                 original_embed.color = 0x00ff00
-                original_embed.title = "Заявка принята!"
-                await interaction.message.edit(embed=original_embed, view=None)
-            await interaction.message.edit(content="**Заявка принята**", view=self)
+                original_embed.title = "✅ Заявка принята"
+                original_embed.add_field(name="Кем принята", value=interaction.user.mention, inline=False)
+                if hasattr(self, 'target_message'):
+                    await self.target_message.edit(embed=original_embed)
+
+            # Удаляем кнопки
+            await interaction.message.delete()
 
             # Выдача роли
-            guild_settings = get_guild_settings(self.guild_id)
+            guild_settings = get_guild_settings(interaction.guild.id)
             role_added = False
             
-            if guild_settings and guild_settings.get('member_role_id'):
+            if guild_settings and guild_settings.get('member_role_id') and guild_settings['member_role_id'] != 'None':
                 try:
-                    member = interaction.guild.get_member(self.applicant_id)
+                    member = interaction.guild.get_member(applicant_id)
                     if member:
                         role = interaction.guild.get_role(int(guild_settings['member_role_id']))
                         if role:
@@ -142,172 +187,138 @@ class ApplicationActionsView(discord.ui.View):
                             role_added = True
                 except Exception as role_error:
                     print(f"Ошибка при выдаче роли: {role_error}")
+                    await interaction.channel.send(f"⚠️ Не удалось выдать роль: {role_error}")
 
-            embed = discord.Embed(title="✅ Заявка принята!", description=f"Заявка от {applicant.mention} одобрена {interaction.user.mention}.", color=0x00ff00)
-            if role_added:
-                embed.add_field(name="Роль", value="Успешно выдана!", inline=False)
-            await interaction.response.send_message(embed=embed)
-            
+            # Уведомление в ЛС
             try:
-                message_text = f"🎉 Ваша заявка в семью была одобрена администратором {interaction.user.name}."
+                applicant = await bot.fetch_user(applicant_id)
+                msg = f"🎉 Ваша заявка в семью на сервере **{interaction.guild.name}** была одобрена!"
                 if role_added:
-                    message_text += "\n✅ Вам была выдана роль участника!"
-                await applicant.send(message_text)
+                    msg += "\n✅ Вам выдана роль участника."
+                await applicant.send(msg)
             except:
-                pass
-                
+                pass # ЛС закрыто
+
+            await interaction.channel.send(f"✅ {interaction.user.mention} принял заявку от <@{applicant_id}>.")
+
         except Exception as e:
-            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
-    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger, custom_id="reject_application")
+    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger, custom_id="app_action_reject")
     async def reject_application(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.processed:
-            await interaction.response.send_message("Заявка уже обработана.", ephemeral=True)
+        await interaction.response.defer()
+        
+        applicant_id, original_embed = await self.get_applicant_id(interaction)
+        
+        if not applicant_id:
+            await interaction.followup.send("❌ Не удалось найти заявку.", ephemeral=True)
             return
-            
-        try:
-            applicant = await bot.fetch_user(self.applicant_id)
-            self.processed = True
-            for item in self.children:
-                item.disabled = True
 
-            original_embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        try:
+            # Обновляем Embed (красный цвет)
             if original_embed:
                 original_embed.color = 0xff0000
-                original_embed.title = "Заявка отклонена"
-                await interaction.message.edit(embed=original_embed, view=None)
-            await interaction.message.edit(content="**Заявка отклонена**", view=self)
+                original_embed.title = "❌ Заявка отклонена"
+                original_embed.add_field(name="Кем отклонена", value=interaction.user.mention, inline=False)
+                if hasattr(self, 'target_message'):
+                    await self.target_message.edit(embed=original_embed)
 
-            embed = discord.Embed(title="❌ Заявка отклонена", description=f"Заявка от {applicant.mention} отклонена {interaction.user.mention}.", color=0xff0000)
-            await interaction.response.send_message(embed=embed)
-            
+            # Удаляем кнопки
+            await interaction.message.delete()
+
+            # Уведомление в ЛС
             try:
-                await applicant.send(f"😔 Ваша заявка в семью была отклонена администратором {interaction.user.name}.")
+                applicant = await bot.fetch_user(applicant_id)
+                await applicant.send(f"😔 Ваша заявка в семью на сервере **{interaction.guild.name}** была отклонена.")
             except:
                 pass
-                
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
 
-class ApplicationView(discord.ui.View):
+            await interaction.channel.send(f"🚫 {interaction.user.mention} отклонил заявку от <@{applicant_id}>.")
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
+
+class StartApplicationView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📝 Подать заявку", style=discord.ButtonStyle.green, custom_id="apply_button")
+    @discord.ui.button(label="📝 Подать заявку", style=discord.ButtonStyle.green, custom_id="start_app_btn")
     async def create_application(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Очищаем старые данные если есть
         if interaction.user.id in application_data:
             del application_data[interaction.user.id]
         await interaction.response.send_modal(ApplicationStep1Modal())
 
+# --- КОМАНДЫ ---
+
+@bot.event
+async def on_ready():
+    init_db()
+    print(f"✅ Family Request Bot {bot.user} запущен!")
+    # Регистрируем Views чтобы они работали после перезагрузки
+    bot.add_view(StartApplicationView())
+    bot.add_view(ContinueApplicationView())
+    bot.add_view(PersistentApplicationActionsView())
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ У вас недостаточно прав для этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Пропущен аргумент. Использование: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+    else:
+        print(f"Ошибка команды: {error}")
+
 @bot.command()
 async def инструкция(ctx):
     """📖 Показывает инструкцию по настройке бота"""
-    embed = discord.Embed(title="📖 Инструкция по настройке Family Request Bot", color=0x00ff00)
-    embed.add_field(
-        name="1. 🏷️ Настройка канала для заявок",
-        value="`!канал #название-канала`",
-        inline=False
-    )
-    embed.add_field(
-        name="2. 🔔 Настройка роли для уведомлений", 
-        value="`!роль_админ @РольАдминистратора`",
-        inline=False
-    )
-    embed.add_field(
-        name="3. 👥 Настройка роли участника",
-        value="`!роль_участник @РольУчастника`", 
-        inline=False
-    )
-    embed.add_field(
-        name="4. 🎯 Создать сообщение с заявкой",
-        value="`!создать_заявку`",
-        inline=False
-    )
-    embed.add_field(
-        name="5. 🔧 Проверить настройки",
-        value="`!настройки`",
-        inline=False
-    )
+    embed = discord.Embed(title="📖 Инструкция по настройке", color=0x00ff00)
+    embed.add_field(name="1. Канал заявок", value="`!канал #название`", inline=False)
+    embed.add_field(name="2. Роль админа (для пинга)", value="`!роль_админ @Роль`", inline=False)
+    embed.add_field(name="3. Роль новичка (автовыдача)", value="`!роль_участник @Роль`", inline=False)
+    embed.add_field(name="4. Запуск", value="`!создать_заявку`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def канал(ctx, канал: discord.TextChannel):
-    """🏷️ Установить канал для заявок"""
     set_guild_settings(ctx.guild.id, channel_id=канал.id)
     await ctx.send(f"✅ Канал для заявок установлен: {канал.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def роль_админ(ctx, роль: discord.Role):
-    """🔔 Установить роль для уведомлений о новых заявках"""
     set_guild_settings(ctx.guild.id, role_id=роль.id)
-    await ctx.send(f"✅ Роль для уведомлений установлена: {роль.mention}")
+    await ctx.send(f"✅ Роль для уведомлений: {роль.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def роль_участник(ctx, роль: discord.Role):
-    """👥 Установить роль которую выдавать при принятии заявки"""
     set_guild_settings(ctx.guild.id, member_role_id=роль.id)
-    await ctx.send(f"✅ Роль участника установлена: {роль.mention}")
+    await ctx.send(f"✅ Роль участника (автовыдача): {роль.mention}")
 
 @bot.command()
+@commands.has_permissions(administrator=True)
 async def создать_заявку(ctx):
-    """🎯 Создаёт сообщение с кнопкой для подачи заявок"""
-    guild_settings = get_guild_settings(ctx.guild.id)
-    if not guild_settings or not guild_settings.get('channel_id'):
-        await ctx.send("❌ Сначала настройте бота командой `!инструкция`")
-        return
-        
-    embed = discord.Embed(title="📝 Заявка в нашу семью", description="Нажмите кнопку ниже чтобы подать заявку на вступление", color=0x00aaff)
-    embed.add_field(name="Процесс", value="• Заполнение анкеты\n• Рассмотрение администрацией\n• Получение ответа", inline=False)
-    embed.set_footer(text="Заполняйте поля внимательно!")
-    
-    await ctx.send(embed=embed, view=ApplicationView())
-    await ctx.send("✅ Система заявок активирована!", delete_after=5)
+    await ctx.message.delete() # Удаляем сообщение команды для красоты
+    embed = discord.Embed(title="📝 Заявка в семью", description="Нажмите кнопку ниже, чтобы начать заполнение анкеты.", color=0x00aaff)
+    embed.set_footer(text="Убедитесь, что у вас открыты личные сообщения.")
+    await ctx.send(embed=embed, view=StartApplicationView())
 
 @bot.command()
 async def настройки(ctx):
-    """🔧 Показывает текущие настройки бота"""
-    guild_settings = get_guild_settings(ctx.guild.id)
+    s = get_guild_settings(ctx.guild.id) or {}
+    embed = discord.Embed(title="⚙️ Настройки", color=0x00aaff)
     
-    embed = discord.Embed(title="⚙️ Текущие настройки бота", color=0x00aaff)
+    ch = f"<#{s.get('channel_id')}>" if s.get('channel_id') else "❌ Нет"
+    r_adm = f"<@&{s.get('role_id')}>" if s.get('role_id') and s.get('role_id') != 'None' else "❌ Нет"
+    r_mem = f"<@&{s.get('member_role_id')}>" if s.get('member_role_id') and s.get('member_role_id') != 'None' else "❌ Нет"
     
-    if guild_settings and guild_settings.get('channel_id'):
-        embed.add_field(name="📁 Канал заявок", value=f"<#{guild_settings['channel_id']}>", inline=True)
-    else:
-        embed.add_field(name="📁 Канал заявок", value="❌ Не настроен", inline=True)
-        
-    if guild_settings and guild_settings.get('role_id'):
-        embed.add_field(name="🔔 Роль уведомлений", value=f"<@&{guild_settings['role_id']}>", inline=True)
-    else:
-        embed.add_field(name="🔔 Роль уведомлений", value="❌ Не настроена", inline=True)
-        
-    if guild_settings and guild_settings.get('member_role_id'):
-        embed.add_field(name="👥 Роль участника", value=f"<@&{guild_settings['member_role_id']}>", inline=True)
-    else:
-        embed.add_field(name="👥 Роль участника", value="❌ Не настроена", inline=True)
-    
+    embed.description = f"**Канал:** {ch}\n**Пинг роль:** {r_adm}\n**Роль новичка:** {r_mem}"
     await ctx.send(embed=embed)
 
-@bot.event
-async def on_ready():
-    print(f"✅ Family Request Bot {bot.user} запущен и готов к работе!")
-    bot.add_view(ApplicationView())
-    bot.add_view(ApplicationActionsView(None, None))
-
-@bot.event
-async def on_guild_join(guild):
-    print(f"✅ Family Request Bot добавлен на сервер: {guild.name} (ID: {guild.id})")
-    
-    # Отправляем сообщение в общий канал
-    for channel in guild.text_channels:
-        if channel.permissions_for(guild.me).send_messages:
-            embed = discord.Embed(title="🎉 Family Request Bot добавлен на сервер!", color=0x00ff00)
-            embed.description = "Бот для управления заявками в семью/гильдию"
-            embed.add_field(name="Быстрый старт", value="1. `!инструкция` - показать инструкцию\n2. Настроить каналы и роли\n3. `!создать_заявку` - активировать систему", inline=False)
-            await channel.send(embed=embed)
-            break
-
 if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
+    if not BOT_TOKEN:
+        print("❌ Ошибка: BOT_TOKEN не найден в .env файле!")
+    else:
+        bot.run(BOT_TOKEN)
